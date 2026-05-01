@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import axios from 'axios'
 
-const API_BASE = 'http://localhost:3001/api'
+const API_BASE = import.meta.env.PROD
+  ? import.meta.env.VITE_API_BASE_URL
+  : `http://${window.location.hostname}:3001/api`
 
 export default function App() {
   const [mode, setMode] = useState('home')
