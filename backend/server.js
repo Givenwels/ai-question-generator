@@ -283,6 +283,21 @@ app.post('/api/voice-to-questions', upload.single('audio'), async (req, res) => 
 });
 
 // ============================================================
+// 生产环境：托管前端静态文件
+// ============================================================
+const frontendDist = path.join(__dirname, '../frontend/dist');
+if (fs.existsSync(frontendDist)) {
+  app.use(express.static(frontendDist));
+  // SPA 回退：非 API 的 GET 请求都返回 index.html
+  app.get('*', (req, res) => {
+    if (!req.path.startsWith('/api')) {
+      res.sendFile(path.join(frontendDist, 'index.html'));
+    }
+  });
+  console.log('[前端] dist 目录已挂载');
+}
+
+// ============================================================
 // 全局错误处理：multer 文件过大 / 格式错误
 // ============================================================
 app.use((err, req, res, next) => {
