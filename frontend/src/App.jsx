@@ -52,43 +52,43 @@ export default function App() {
       setElapsedSeconds(Math.floor((Date.now() - startTimeRef.current) / 1000))
     }, 1000)
 
-    // 90 秒超时自动取消
-    timeoutRef.current = setTimeout(() => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort()
-        abortControllerRef.current = null
-      }
-      setLoading(false)
-      clearAllTimers()
-      setStage('')
-    }, 90000)
-
-    if (activeTab === 0) {
-      setStage('generating')
-    } else {
-      setStage('uploading')
-      const t1 = setTimeout(() => setStage('asr'), 3000)
-      const t2 = setTimeout(() => setStage('generating'), 15000)
-      stageTimersRef.current = [t1, t2]
-    }
-
     try {
       let res
       if (activeTab === 0) {
-        res = await axios.post(`${API_BASE}/generate`, { text: textInput }, { signal: controller.signal })
+        // 纯文字：直接出题
+        setStage('generating')
+        res = await axios.post(`${API_BASE}/generate`, { text: textInput }, {
+          signal: controller.signal,
+          timeout: 75000,
+        })
       } else {
+        // 语音链路：先真实转写，再出题——阶段随真实进度变化，不再用假计时器
+        setStage('asr')
         const formData = new FormData()
         if (activeTab === 1) {
           formData.append('audio', audioBlob, 'recording.webm')
         } else {
           formData.append('audio', audioFile)
         }
-        res = await axios.post(`${API_BASE}/voice-to-questions`, formData, { signal: controller.signal })
+        const tRes = await axios.post(`${API_BASE}/transcribe`, formData, {
+          signal: controller.signal,
+          timeout: 75000,
+        })
+        if (!tRes.data.success || !tRes.data.transcript) {
+          throw new Error('语音识别失败，请重试')
+        }
+        setGeneratedTranscript(tRes.data.transcript)
+
+        setStage('generating')
+        res = await axios.post(`${API_BASE}/generate`, { text: tRes.data.transcript }, {
+          signal: controller.signal,
+          timeout: 75000,
+        })
       }
 
       if (res.data.success && res.data.questions?.length > 0) {
         setGeneratedQuestions(res.data.questions)
-        setGeneratedTranscript(res.data.transcript || '')
+        setGeneratedTranscript((prev) => prev || res.data.transcript || '')
       } else {
         throw new Error('生成题目失败，请重试')
       }
@@ -122,6 +122,32 @@ export default function App() {
     setElapsedSeconds(0)
   }
 
+  // 错题重练：把错题本里的错题发给后端，生成同类变式题
+  const handleRepractice = async (wrongList) => {
+    const items = wrongList
+      .map((w) => ({
+        question: w.question?.question || '',
+        options: Array.isArray(w.question?.options) ? w.question.options : [],
+        answer: w.question?.answer || '',
+        explanation: w.question?.explanation || '',
+        userAnswer: w.userAnswer || '',
+      }))
+      .filter((w) => w.question)
+
+    if (items.length === 0) {
+      throw new Error('没有可重练的错题')
+    }
+
+    const res = await axios.post(`${API_BASE}/regenerate-from-wrong`, { wrong: items }, { timeout: 75000 })
+    if (res.data.success && res.data.questions?.length > 0) {
+      setGeneratedQuestions(res.data.questions)
+      setGeneratedTranscript('')
+      setMode('quiz')
+    } else {
+      throw new Error('重练题目生成失败，请重试')
+    }
+  }
+
   return (
     <div className="min-h-screen bg-gray-50">
       <div className="max-w-2xl mx-auto px-4 py-6">
@@ -146,7 +172,7 @@ export default function App() {
             onGoWrong={() => setMode('wrong')}
           />
         )}
-        {mode === 'wrong' && <WrongPage onBack={() => setMode('home')} />}
+        {mode === 'wrong' && <WrongPage onBack={() => setMode('home')} onRepractice={handleRepractice} />}
       </div>
     </div>
   )
@@ -198,20 +224,6 @@ function HomePage({ loading, generatedQuestions, elapsedSeconds, stage, onGenera
   const [isDragOver, setIsDragOver] = useState(false)
   const fileInputRef = useRef(null)
   const MAX_FILE_SIZE = 8 * 1024 * 1024 // 8MB
-
-  // 检测 90 秒超时（loading 结束但无结果且耗时接近 90 秒）
-  const loadingStartRef = useRef(0)
-  const prevLoadingRef = useRef(false)
-  useEffect(() => {
-    if (loading) {
-      loadingStartRef.current = Date.now()
-    } else if (prevLoadingRef.current && !loading && !generatedQuestions) {
-      if (Date.now() - loadingStartRef.current >= 87000) {
-        setToast({ message: '请求超时，请检查网络或缩短输入内容', type: 'error' })
-      }
-    }
-    prevLoadingRef.current = loading
-  }, [loading, generatedQuestions])
 
   // 清理录音资源
   const cleanupRecording = useCallback(() => {
@@ -348,7 +360,7 @@ function HomePage({ loading, generatedQuestions, elapsedSeconds, stage, onGenera
   }
 
   // ---- 状态 UI：loading / 已生成 / 空白 ----
-  const stageLabelMap = { uploading: '📤 上传中...', asr: '🎙️ AI 识别语音中...', generating: '🤖 AI 出题中...' }
+  const stageLabelMap = { asr: '🎙️ AI 识别语音中...', generating: '🤖 AI 出题中...' }
 
   const renderBody = () => {
     if (loading) {
@@ -632,13 +644,15 @@ function QuizPage({ questions, transcript, onBack, onGoWrong }) {
     }
   }
 
-  // 保存错题到 localStorage
+  // 保存错题到 localStorage（用后端分配的全局唯一 qid 去重，避免每轮 id 从 1 开始导致误判重复）
   const saveWrongQuestion = (q, userAnswer) => {
     try {
       const wrongQuestions = JSON.parse(localStorage.getItem('wrongQuestions') || '[]')
-      const exists = wrongQuestions.find((w) => w.question.id === q.id)
+      const qid = q.qid || `${q.id}-${q.question.slice(0, 24)}`
+      const exists = wrongQuestions.find((w) => w.qid === qid)
       if (exists) return
       wrongQuestions.push({
+        qid,
         question: q,
         userAnswer,
         wrongAt: new Date().toISOString(),
@@ -704,12 +718,12 @@ function QuizPage({ questions, transcript, onBack, onGoWrong }) {
             {/* 题目文字 */}
             <p className="text-base font-medium text-gray-800 mb-4">{q.question}</p>
 
-            {/* 选择题选项 */}
+            {/* 选择题选项（options 已由后端 normalize 为 [{key,text}] 数组） */}
             {isChoice && q.options && (
               <div className="space-y-2">
                 {q.options.map((opt) => {
-                  const key = typeof opt === 'string' ? opt.charAt(0) : opt
-                  const label = typeof opt === 'string' ? opt.slice(2).trim() : opt
+                  const key = opt.key
+                  const label = opt.text
 
                   let borderClass = 'border-gray-200 hover:border-blue-300'
                   let bgClass = ''
@@ -844,8 +858,10 @@ function QuizPage({ questions, transcript, onBack, onGoWrong }) {
 }
 
 // ==================== 错题本 ====================
-function WrongPage({ onBack }) {
+function WrongPage({ onBack, onRepractice }) {
   const [wrongList, setWrongList] = useState([])
+  const [practicing, setPracticing] = useState(false)
+  const [practiceError, setPracticeError] = useState('')
 
   useEffect(() => {
     try {
@@ -860,6 +876,20 @@ function WrongPage({ onBack }) {
     if (window.confirm('确定要清空所有错题吗？此操作不可恢复。')) {
       localStorage.removeItem('wrongQuestions')
       setWrongList([])
+    }
+  }
+
+  // 错题重练：针对这批错题生成同类变式题，生成完直接进入答题
+  const handleRepracticeClick = async () => {
+    if (practicing) return
+    setPracticing(true)
+    setPracticeError('')
+    try {
+      await onRepractice(wrongList)
+    } catch (err) {
+      setPracticeError(err.response?.data?.error || err.message || '重练题目生成失败')
+    } finally {
+      setPracticing(false)
     }
   }
 
@@ -881,7 +911,35 @@ function WrongPage({ onBack }) {
       </div>
 
       <h2 className="text-xl font-bold text-gray-800 mb-1">📝 错题本</h2>
-      <p className="text-sm text-gray-400 mb-5">共 {wrongList.length} 道错题</p>
+      <p className="text-sm text-gray-400 mb-3">共 {wrongList.length} 道错题</p>
+
+      {wrongList.length > 0 && (
+        <div className="mb-5">
+          <button
+            onClick={handleRepracticeClick}
+            disabled={practicing}
+            className={
+              'w-full py-3.5 rounded-2xl text-white font-bold shadow-md transition flex items-center justify-center gap-2 ' +
+              (practicing ? 'bg-blue-300 cursor-not-allowed' : 'bg-blue-500 hover:bg-blue-600 active:scale-[0.98]')
+            }
+          >
+            {practicing ? (
+              <>
+                <svg className="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                AI 正在针对错题出新题...
+              </>
+            ) : (
+              <>🔁 错题重练 · 针对这 {wrongList.length} 题生成同类变式题</>
+            )}
+          </button>
+          {practiceError && (
+            <p className="mt-2 text-sm text-red-500 text-center">{practiceError}</p>
+          )}
+        </div>
+      )}
 
       {wrongList.length === 0 && (
         <div className="bg-white rounded-2xl shadow-md p-10 text-center">
@@ -909,8 +967,8 @@ function WrongPage({ onBack }) {
             {isChoice && q.options && (
               <div className="space-y-1.5 mb-3">
                 {q.options.map((opt) => {
-                  const key = typeof opt === 'string' ? opt.charAt(0) : opt
-                  const label = typeof opt === 'string' ? opt.slice(2).trim() : opt
+                  const key = opt.key
+                  const label = opt.text
 
                   let cls = 'text-sm text-gray-400'
                   if (key === q.answer) cls = 'text-sm text-green-600 font-medium'
